@@ -35,7 +35,7 @@ const ( // start of the values taken from the HAR file
 	acceptHeaderValue           = "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" // the Accept header from the HAR
 ) // end of the values taken from the HAR file
 
-var sessionCookieHeaderValue = "ASP.NET_SessionId=gvzs0u3g4pk5hvofagw522vi" // the logged in session cookie copied from your browser request; replace it when the session expires
+var sessionCookieHeaderValue = "ASP.NET_SessionId=nwhsbbzl2hs5ncz3rll1iyev" // the logged in session cookie copied from your browser request; replace it when the session expires
 
 var ( // start of the compiled patterns shared by the whole program
 	inputTagPattern                 = regexp.MustCompile(`(?is)<input\b[^>]*>`)                                             // matches one complete <input ...> tag
