@@ -24,7 +24,6 @@ const ( // start of the fixed settings that replace command line arguments
 	outputDirectoryName          = "PDFs/"                                                         // the folder where PDFs are saved
 	pauseBetweenRequestsDuration = time.Second                                                     // how long to wait between requests to stay polite
 	expectedRowsPerPage          = 25                                                              // the listing shows 25 amendments per page, used only for the progress message
-	downloadedManifestFileName   = "downloaded_standards.txt"                                      // remembers which standards are saved so they are skipped without any request
 	maximumPagesToWalk           = 500                                                             // safety limit so a pager bug can never loop forever
 ) // end of the fixed settings
 
@@ -35,7 +34,7 @@ const ( // start of the values taken from the HAR file
 	acceptHeaderValue           = "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" // the Accept header from the HAR
 ) // end of the values taken from the HAR file
 
-var sessionCookieHeaderValue = "ASP.NET_SessionId=nwhsbbzl2hs5ncz3rll1iyev" // the logged in session cookie copied from your browser request; replace it when the session expires
+var sessionCookieHeaderValue = "ASP.NET_SessionId=bqgp1a1gue2yknz2mpujexok" // the logged in session cookie copied from your browser request; replace it when the session expires
 
 var ( // start of the compiled patterns shared by the whole program
 	inputTagPattern                 = regexp.MustCompile(`(?is)<input\b[^>]*>`)                                             // matches one complete <input ...> tag
@@ -45,6 +44,7 @@ var ( // start of the compiled patterns shared by the whole program
 	anyHtmlTagPattern               = regexp.MustCompile(`(?s)<[^>]*>`)                                                     // matches any HTML tag so we can strip tags from link text
 	activePageLinkPattern           = regexp.MustCompile(`(?is)<a\b[^>]*class="active"[^>]*>\s*(\d+)\s*</a>`)               // matches the pager link that is marked as the current page
 	rowStandardNumberPattern        = regexp.MustCompile(`(?is)Repeater1_ctl(\d+)_lblstdno_rptr"[^>]*>(.*?)</span>`)        // matches the row number and standard number text of one listing row
+	predictedFileNamePattern        = regexp.MustCompile(`(?i)^\s*IS\s+(\d+)(?:\s*:\s*Part\s+(\d+))?\s+Amd\.?\s*(\d+)`)     // matches standards like IS 15844 : Part 1 Amd. 3 : 2026
 	buttonRowNumberPattern          = regexp.MustCompile(`Repeater1\$ctl(\d+)\$`)                                           // matches the row number inside a PDF button name
 	unsafeFileNameCharactersPattern = regexp.MustCompile(`[^\w.\-]+`)                                                       // matches every character that is not safe inside a file name
 ) // end of the shared patterns
@@ -159,22 +159,6 @@ func findRowNumberOfButton(buttonName string) string { // returns the row number
 	return matchParts[1] // the digits of the row number
 } // end of findRowNumberOfButton
 
-// loadDownloadedStandards reads the list of standards that were already saved in earlier runs.
-func loadDownloadedStandards(manifestPath string) map[string]string { // returns a map of standard number to file name
-	downloadedStandards := map[string]string{}            // empty map to fill
-	manifestBytes, readError := os.ReadFile(manifestPath) // read the manifest if it exists
-	if readError != nil {                                 // a missing manifest simply means this is the first run
-		return downloadedStandards // return the empty map
-	} // end of the read check
-	for _, manifestLine := range strings.Split(string(manifestBytes), "\n") { // loop over every line of the manifest
-		lineParts := strings.SplitN(manifestLine, "\t", 2) // each line is the standard number, a tab and the file name
-		if len(lineParts) == 2 && lineParts[0] != "" {     // ignore blank or damaged lines
-			downloadedStandards[lineParts[0]] = lineParts[1] // remember this standard as already downloaded
-		} // end of the line check
-	} // end of the line loop
-	return downloadedStandards // give the map back
-} // end of loadDownloadedStandards
-
 // startLogging makes every log line appear on the console with a precise timestamp.
 func startLogging() { // takes no input and returns nothing
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds) // timestamps with microseconds make the order of events clear
@@ -194,16 +178,35 @@ func (crawler *PdfCrawler) logVisitedAddresses() { // takes no input, only logs
 	} // end of the summary loop
 } // end of logVisitedAddresses
 
+// predictFileNameFromStandardNumber works out the server's file name from a standard number, or returns an empty string when unsure.
+func predictFileNameFromStandardNumber(standardNumber string) string { // for example "IS 15844 : Part 1 Amd. 3 : 2026" gives "15844_1_amd3.pdf"
+	matchParts := predictedFileNamePattern.FindStringSubmatch(standardNumber) // pick out the standard number, the optional part and the amendment number
+	if matchParts == nil {                                                    // when the text does not follow the known pattern
+		return "" // make no prediction, the file name is then taken from the server's answer instead
+	} // end of the pattern check
+	predictedFileName := matchParts[1] // start with the standard number, such as 15844
+	if matchParts[2] != "" {           // when the standard has a part number
+		predictedFileName += "_" + matchParts[2] // add it after an underscore
+	} // end of the part check
+	predictedFileName += "_amd" + matchParts[3] + ".pdf" // finish with the amendment number and the extension
+	return predictedFileName                             // give the predicted name back
+} // end of predictFileNameFromStandardNumber
+
+// fileExistsOnDisk reports whether a file with this path is already saved.
+func fileExistsOnDisk(filePath string) bool { // takes the full path, returns true when the file exists
+	_, statError := os.Stat(filePath) // ask the file system about the path
+	return statError == nil           // no error means the file exists
+} // end of fileExistsOnDisk
+
 // PdfCrawler holds everything needed to walk the listing and save PDFs.
 type PdfCrawler struct { // start of the crawler settings
-	httpClient           *http.Client      // the HTTP client that keeps cookies
-	listingPageUrl       string            // the address of the listing page
-	outputDirectory      string            // the folder where PDFs are saved
-	pauseBetweenRequests time.Duration     // how long to wait between requests
-	downloadedStandards  map[string]string // standards already saved, read from and written to the manifest file
-	visitedAddressCounts map[string]int    // how many requests were sent to each method and address
-	requestCounter       int               // numbers the requests so the log lines can be matched up
-	sessionCookieHeader  string            // the Cookie header that identifies our logged in session
+	httpClient           *http.Client   // the HTTP client that keeps cookies
+	listingPageUrl       string         // the address of the listing page
+	outputDirectory      string         // the folder where PDFs are saved
+	pauseBetweenRequests time.Duration  // how long to wait between requests
+	visitedAddressCounts map[string]int // how many requests were sent to each method and address
+	requestCounter       int            // numbers the requests so the log lines can be matched up
+	sessionCookieHeader  string         // the Cookie header that identifies our logged in session
 } // end of the PdfCrawler type
 
 // sendRequestWithRetries sends a request, logs it, and retries up to three times on network or server errors.
@@ -336,18 +339,6 @@ func (crawler *PdfCrawler) downloadPdfByButton(pageHtml string, buttonName strin
 	return fileName, true, renameError                                                      // report the file as saved
 } // end of downloadPdfByButton
 
-// recordDownloadedStandard remembers a saved standard in memory and appends it to the manifest file.
-func (crawler *PdfCrawler) recordDownloadedStandard(standardNumber string, savedFileName string) { // takes the standard number and its file name
-	crawler.downloadedStandards[standardNumber] = savedFileName                                                                                            // remember it in memory for the rest of this run
-	manifestFile, openError := os.OpenFile(filepath.Join(crawler.outputDirectory, downloadedManifestFileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) // open the manifest for appending
-	if openError != nil {                                                                                                                                  // when the manifest cannot be opened
-		log.Printf("  could not update the manifest: %v", openError) // warn but keep going
-		return                                                       // nothing more to do
-	} // end of the open check
-	defer manifestFile.Close()                                           // always close the manifest when we are done
-	fmt.Fprintf(manifestFile, "%s\t%s\n", standardNumber, savedFileName) // write one line: standard number, tab, file name
-} // end of recordDownloadedStandard
-
 func main() { // program entry point
 	startLogging()                                                                                                                                                                                                                // send all log lines to the console
 	log.Printf("program started, logging to the console only")                                                                                                                                                                    // first log line
@@ -366,16 +357,14 @@ func main() { // program entry point
 
 	cookieJar, _ := cookiejar.New(nil) // cookie storage so the session carries across requests
 	crawler := &PdfCrawler{            // build the crawler
-		httpClient:           &http.Client{Jar: cookieJar, Timeout: 3 * time.Minute},                                  // client with cookies and a generous timeout
-		listingPageUrl:       listingPageAddress,                                                                      // the page to crawl
-		outputDirectory:      outputDirectoryName,                                                                     // where to save files
-		pauseBetweenRequests: pauseBetweenRequestsDuration,                                                            // how long to wait between requests
-		downloadedStandards:  loadDownloadedStandards(filepath.Join(outputDirectoryName, downloadedManifestFileName)), // standards saved in earlier runs
-		visitedAddressCounts: map[string]int{},                                                                        // starts empty and fills as addresses are visited
-		sessionCookieHeader:  sessionCookieHeaderValue,                                                                // the cookie that proves we are logged in
+		httpClient:           &http.Client{Jar: cookieJar, Timeout: 3 * time.Minute}, // client with cookies and a generous timeout
+		listingPageUrl:       listingPageAddress,                                     // the page to crawl
+		outputDirectory:      outputDirectoryName,                                    // where to save files
+		pauseBetweenRequests: pauseBetweenRequestsDuration,                           // how long to wait between requests
+		visitedAddressCounts: map[string]int{},                                       // starts empty and fills as addresses are visited
+		sessionCookieHeader:  sessionCookieHeaderValue,                               // the cookie that proves we are logged in
 	} // end of the crawler setup
-	log.Printf("loaded %d already downloaded standards from %s", len(crawler.downloadedStandards), downloadedManifestFileName) // log how many will be skipped
-	crawler.httpClient.CheckRedirect = func(nextRequest *http.Request, previousRequests []*http.Request) error {               // called whenever the server redirects us
+	crawler.httpClient.CheckRedirect = func(nextRequest *http.Request, previousRequests []*http.Request) error { // called whenever the server redirects us
 		crawler.visitedAddressCounts["REDIRECT "+nextRequest.URL.String()]++                                     // count the redirect target as a visited address
 		log.Printf("redirect #%d: the server sent us on to %s", len(previousRequests), nextRequest.URL.String()) // log the new address
 		if len(previousRequests) >= 10 {                                                                         // guard against endless redirect loops
@@ -423,11 +412,12 @@ func main() { // program entry point
 			} // end of the button check
 		} // end of the row loop
 		for _, buttonName := range pdfButtonNames { // click each button in turn
-			standardNumber := standardNumberByRowNumber[findRowNumberOfButton(buttonName)]                                        // the standard this button belongs to
-			if savedFileName, alreadySaved := crawler.downloadedStandards[standardNumber]; alreadySaved && standardNumber != "" { // when this standard is already on disk
-				skippedCount++                                                                                        // count the skip
-				log.Printf("  skipped %s (already downloaded as %s), no request sent", standardNumber, savedFileName) // say it was skipped without any request
-				continue                                                                                              // move straight on to the next button
+			standardNumber := standardNumberByRowNumber[findRowNumberOfButton(buttonName)]                              // the standard this button belongs to
+			predictedFileName := predictFileNameFromStandardNumber(standardNumber)                                      // work out the file name the server will use for this standard
+			if predictedFileName != "" && fileExistsOnDisk(filepath.Join(crawler.outputDirectory, predictedFileName)) { // when that file is already saved
+				skippedCount++                                                                                          // count the skip
+				log.Printf("  skipped %s (file %s already exists), no request sent", standardNumber, predictedFileName) // say it was skipped without any request
+				continue                                                                                                // move straight on to the next button
 			} // end of the already downloaded check
 			downloadNumber++                                                                                                                   // count this attempt
 			savedFileName, wasSaved, downloadError := crawler.downloadPdfByButton(currentPageHtml, buttonName, standardNumber, downloadNumber) // try the download
@@ -442,9 +432,6 @@ func main() { // program entry point
 				skippedCount++                                                                     // count the skip
 				log.Printf("  skipped %s (file %s already exists)", standardNumber, savedFileName) // say it was skipped
 			} // end of the result switch
-			if downloadError == nil && standardNumber != "" { // when the file is safely on disk
-				crawler.recordDownloadedStandard(standardNumber, savedFileName) // remember it so the next run skips it with no request
-			} // end of the record check
 			log.Printf("pausing %s before the next request", crawler.pauseBetweenRequests) // log the pause
 			time.Sleep(crawler.pauseBetweenRequests)                                       // be polite to the server
 		} // end of the button loop
